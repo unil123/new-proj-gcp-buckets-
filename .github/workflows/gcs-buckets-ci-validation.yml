@@ -1,36 +1,265 @@
-# This is a basic workflow to help you get started with Actions
-
-name: CI
-
-# Controls when the workflow will run
+name: gcs-buckets-bu-ci-validation
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
-  push:
-    branches: [ "main" ]
   pull_request:
-    branches: [ "main" ]
+    types: [opened, synchronize, reopened]
+    branches: [ test, stage, main ]
+    paths:
+      - 'terraform/modules/gcs-buckets-bu/**'
+      - 'terraform/gcs-buckets-bu/envs/**'
+      - '.github/workflows/gcs-buckets-bu-ci-validation.yaml'
+      - '.github/workflows/gcs-buckets-bu-cd-apply.yaml'
 
-  # Allows you to run this workflow manually from the Actions tab
-  workflow_dispatch:
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+env:
+  TERRAFORM_VERSION: "1.9.8"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  TFLOCK_TIMEOUT: "60s"
+
 jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
+  gcs-buckets-bu-ci:
+    environment: ${{ github.base_ref == 'main' && 'production' || github.base_ref }}
     runs-on: ubuntu-latest
+    concurrency:
+      group: ci-${{ github.base_ref == 'main' && 'production' || github.base_ref }}-${{ github.event.pull_request.head.sha }}
+      cancel-in-progress: true
 
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v4
+      - name: Checkout (PR source)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
 
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
 
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
+      - name: Resolve env & workdir
+        id: resolve
+        shell: bash
         run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+          set -euo pipefail
+          ENV="${{ github.base_ref == 'main' && 'production' || github.base_ref }}"
+          case "$ENV" in test|stage|production) ;; *) echo "::error ::Invalid env '$ENV'"; exit 1;; esac
+          WORK_DIR="terraform/gcs-buckets-bu/envs/${ENV}"
+          BACKEND_PREFIX="terraform/state/gcs-buckets-bu/envs/${ENV}"
+          if [ ! -d "$WORK_DIR" ] || ! compgen -G "${WORK_DIR}/*.tf" >/dev/null; then
+            echo "::error ::No Terraform files for env='${ENV}' in '${WORK_DIR}'"; exit 1
+          fi
+          echo "env=${ENV}" >> "$GITHUB_OUTPUT"
+          echo "work_dir=${WORK_DIR}" >> "$GITHUB_OUTPUT"
+          echo "backend_prefix=${BACKEND_PREFIX}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate paths scope • GCS buckets only
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "### Verifying workflow is scoped to GCS buckets paths only:"
+          echo "Environment: ${{ steps.resolve.outputs.env }}"
+          echo "Work directory: ${{ steps.resolve.outputs.work_dir }}"
+          echo "Backend prefix: ${{ steps.resolve.outputs.backend_prefix }}"
+          
+          if [[ "${{ steps.resolve.outputs.work_dir }}" != terraform/gcs-buckets-bu/envs/* ]]; then
+            echo "::error ::Work directory is outside GCS buckets scope: ${{ steps.resolve.outputs.work_dir }}"
+            exit 1
+          fi
+          
+          if [ ! -d "terraform/modules/gcs-buckets-bu" ]; then
+            echo "::error ::GCS buckets module directory not found: terraform/modules/gcs-buckets-bu"
+            exit 1
+          fi
+          
+          echo "✓ Paths validation passed - workflow scoped to GCS buckets only"
+
+      - name: Cleanup • GCS buckets paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          ENV_DIR="${{ steps.resolve.outputs.work_dir }}"
+          MOD_DIR="terraform/modules/gcs-buckets-bu"
+          
+          rm -rf "${ENV_DIR}/.terraform"
+          rm -f "${ENV_DIR}/terraform.tfstate" \
+                "${ENV_DIR}/terraform.tfstate.backup" \
+                "${ENV_DIR}/crash.log" \
+                "${ENV_DIR}/.terraform.lock.hcl.tmp" || true
+          find "${ENV_DIR}" -type f \( -name '*.tmp' -o -name '*~' -o -name '*.swp' -o -name '*.bak' \) -delete 2>/dev/null || true
+          
+          rm -rf "${MOD_DIR}/.terraform"
+          rm -f "${MOD_DIR}/crash.log" "${MOD_DIR}/.terraform.lock.hcl.tmp" || true
+          find "${MOD_DIR}" -type f \( -name '*.tmp' -o -name '*~' -o -name '*.swp' -o -name '*.bak' \) -delete 2>/dev/null || true
+
+      - name: Terraform fmt check (env workdir)
+        shell: bash
+        working-directory: ${{ steps.resolve.outputs.work_dir }}
+        run: terraform fmt -recursive -check
+
+      - name: Terraform fmt check (gcs-buckets-bu module)
+        shell: bash
+        working-directory: terraform/modules/gcs-buckets-bu
+        run: terraform fmt -recursive -check
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+
+      - name: TFLint (gcs-buckets-bu module)
+        shell: bash
+        working-directory: terraform/modules/gcs-buckets-bu
+        run: |
+          set -euo pipefail
+          echo "### TFLint validation for GCS buckets module"
+          tflint --init || true
+          if tflint --chdir . -f compact; then
+            echo "✓ Module TFLint validation passed"
+          else
+            echo "❌ Module TFLint validation failed"
+            exit 1
+          fi
+
+      - name: Diagnostics & Guard • GCS buckets env workdir contents
+        shell: bash
+        working-directory: ${{ steps.resolve.outputs.work_dir }}
+        run: |
+          set -euo pipefail
+          echo "### Listing *.tf files in GCS buckets env workdir ($(pwd)):"
+          ls -la *.tf 2>/dev/null || echo "No .tf files found"
+          echo
+          echo '### Checking for GCS buckets JSON variable declarations:'
+          if compgen -G "*.tf" > /dev/null; then
+            JSON_VAR_COUNT=$(grep -cE '^[[:space:]]*variable[[:space:]]+"gcs_bu_task_.*_json"[[:space:]]*\{' -- *.tf || echo 0)
+            echo "Found ${JSON_VAR_COUNT} GCS buckets JSON variable(s) - expected for this configuration."
+            
+            ENV="${{ steps.resolve.outputs.env }}"
+            EXPECTED_VAR="gcs_bu_task_${ENV}_json"
+            if grep -qE "^[[:space:]]*variable[[:space:]]+\"${EXPECTED_VAR}\"[[:space:]]*\{" -- *.tf; then
+              echo "✓ Found expected variable '${EXPECTED_VAR}' for environment '${ENV}'"
+            else
+              echo "::warning ::Expected variable '${EXPECTED_VAR}' not found in .tf files"
+            fi
+          else
+            echo "No *.tf files found in GCS buckets env workdir; skipping check."
+          fi
+
+      - name: TFLint (env workdir)
+        shell: bash
+        working-directory: ${{ steps.resolve.outputs.work_dir }}
+        run: |
+          set -euo pipefail
+          echo "### TFLint validation for environment workdir (syntax & structure)"
+          tflint --init || true
+          if tflint --chdir . -f compact --call-module-type=none; then
+            echo "✓ Environment TFLint validation passed"
+          else
+            echo "❌ Environment TFLint validation failed"
+            exit 1
+          fi
+
+      - name: Authenticate to GCP (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT_EMAIL }}
+          create_credentials_file: true
+          export_environment_variables: true
+
+      - name: Prep logs
+        id: logs
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG_DIR="${GITHUB_WORKSPACE}/logs/${GITHUB_RUN_ID}"
+          mkdir -p "$LOG_DIR"
+          echo "LOG_DIR=$LOG_DIR" >> "$GITHUB_OUTPUT"
+          echo "TF_LOG_FILE=$LOG_DIR/tf-all.log" >> "$GITHUB_ENV"
+          echo "TF_LOG=DEBUG" >> "$GITHUB_ENV"
+
+      - name: Export TF_VARs for GCS buckets
+        shell: bash
+        env:
+          GCS_BU_TASK_TEST_JSON: ${{ secrets.GCS_BU_TASK_TEST_JSON }}
+          GCS_BU_TASK_STAGE_JSON: ${{ secrets.GCS_BU_TASK_STAGE_JSON }}
+          GCS_BU_TASK_PROD_JSON: ${{ secrets.GCS_BU_TASK_PROD_JSON }}
+        run: |
+          set -euo pipefail
+          ENV="${{ steps.resolve.outputs.env }}"
+          
+          case "$ENV" in
+            test)
+              [ -n "${GCS_BU_TASK_TEST_JSON:-}" ] || { echo "::error ::Missing required secret: GCS_BU_TASK_TEST_JSON"; exit 1; }
+              {
+                echo "TF_VAR_gcs_bu_task_test_json<<EOF"
+                echo "$GCS_BU_TASK_TEST_JSON"
+                echo "EOF"
+              } >> "$GITHUB_ENV"
+              ;;
+            stage)
+              [ -n "${GCS_BU_TASK_STAGE_JSON:-}" ] || { echo "::error ::Missing required secret: GCS_BU_TASK_STAGE_JSON"; exit 1; }
+              {
+                echo "TF_VAR_gcs_bu_task_stage_json<<EOF"
+                echo "$GCS_BU_TASK_STAGE_JSON"
+                echo "EOF"
+              } >> "$GITHUB_ENV"
+              ;;
+            production)
+              [ -n "${GCS_BU_TASK_PROD_JSON:-}" ] || { echo "::error ::Missing required secret: GCS_BU_TASK_PROD_JSON"; exit 1; }
+              {
+                echo "TF_VAR_gcs_bu_task_prod_json<<EOF"
+                echo "$GCS_BU_TASK_PROD_JSON"
+                echo "EOF"
+              } >> "$GITHUB_ENV"
+              ;;
+          esac
+
+      - name: Debug • Verify GCS buckets configuration present
+        shell: bash
+        run: |
+          set -euo pipefail
+          ENV="${{ steps.resolve.outputs.env }}"
+          case "$ENV" in
+            test)
+              [ -n "${TF_VAR_gcs_bu_task_test_json:-}" ] || { echo "::error ::Missing TF_VAR_gcs_bu_task_test_json"; exit 1; }
+              echo "TF_VAR_gcs_bu_task_test_json set ✔"
+              ;;
+            stage)
+              [ -n "${TF_VAR_gcs_bu_task_stage_json:-}" ] || { echo "::error ::Missing TF_VAR_gcs_bu_task_stage_json"; exit 1; }
+              echo "TF_VAR_gcs_bu_task_stage_json set ✔"
+              ;;
+            production)
+              [ -n "${TF_VAR_gcs_bu_task_prod_json:-}" ] || { echo "::error ::Missing TF_VAR_gcs_bu_task_prod_json"; exit 1; }
+              echo "TF_VAR_gcs_bu_task_prod_json set ✔"
+              ;;
+          esac
+
+      - name: Terraform init
+        working-directory: ${{ steps.resolve.outputs.work_dir }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="prefix=${{ steps.resolve.outputs.backend_prefix }}" \
+            -input=false 2>&1 | tee -a "$TF_LOG_FILE"
+
+      - name: Terraform validate
+        working-directory: ${{ steps.resolve.outputs.work_dir }}
+        run: terraform validate 2>&1 | tee -a "$TF_LOG_FILE"
+
+      - name: Terraform plan
+        id: plan
+        working-directory: ${{ steps.resolve.outputs.work_dir }}
+        run: terraform plan -input=false -lock-timeout=${{ env.TFLOCK_TIMEOUT }} 2>&1 | tee plan-output.txt
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-ci-${{ steps.resolve.outputs.env }}
+          path: |
+            ${{ steps.resolve.outputs.work_dir }}/plan-output.txt
+            ${{ steps.logs.outputs.LOG_DIR }}/tf-all.log
+          retention-days: 9
