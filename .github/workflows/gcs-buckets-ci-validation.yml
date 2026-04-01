@@ -21,7 +21,7 @@ env:
   TFLOCK_TIMEOUT: "60s"
 
 jobs:
-  gcs-buckets-bu-ci:
+  gcs-buckets-ci:
     environment: ${{ github.base_ref == 'main' && 'production' || github.base_ref }}
     runs-on: ubuntu-latest
     concurrency:
