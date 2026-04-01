@@ -5,7 +5,7 @@ on:
     branches: [ test, stage, main ]
     paths:
       - 'terraform/modules/gcs-buckets/**' 
-      - 'terraform/gcs-buckets/envs/**' 
+      - 'terraform/gcs-buckets/env/**' 
       - '.github/workflows/gcs-buckets-ci-validation.yaml'
       - '.github/workflows/gcs-buckets-cd-apply.yaml'
 
@@ -48,8 +48,8 @@ jobs:
           set -euo pipefail
           ENV="${{ github.base_ref == 'main' && 'production' || github.base_ref }}"
           case "$ENV" in test|stage|production) ;; *) echo "::error ::Invalid env '$ENV'"; exit 1;; esac
-          WORK_DIR="terraform/gcs-buckets/envs/${ENV}"
-          BACKEND_PREFIX="terraform/state/gcs-buckets/envs/${ENV}"
+          WORK_DIR="terraform/gcs-buckets/env/${ENV}"
+          BACKEND_PREFIX="terraform/state/gcs-buckets/env/${ENV}"
           if [ ! -d "$WORK_DIR" ] || ! compgen -G "${WORK_DIR}/*.tf" >/dev/null; then
             echo "::error ::No Terraform files for env='${ENV}' in '${WORK_DIR}'"; exit 1
           fi
@@ -66,7 +66,7 @@ jobs:
           echo "Work directory: ${{ steps.resolve.outputs.work_dir }}"
           echo "Backend prefix: ${{ steps.resolve.outputs.backend_prefix }}"
           
-          if [[ "${{ steps.resolve.outputs.work_dir }}" != terraform/gcs-buckets/envs/* ]]; then
+          if [[ "${{ steps.resolve.outputs.work_dir }}" != terraform/gcs-buckets/env/* ]]; then
             echo "::error ::Work directory is outside GCS buckets scope: ${{ steps.resolve.outputs.work_dir }}"
             exit 1
           fi
@@ -83,7 +83,7 @@ jobs:
         run: |
           set -euo pipefail
           ENV_DIR="${{ steps.resolve.outputs.work_dir }}"
-          MOD_DIR="terraform/modules/gcs-buckets-bu"
+          MOD_DIR="terraform/modules/gcs-buckets"
           
           rm -rf "${ENV_DIR}/.terraform"
           rm -f "${ENV_DIR}/terraform.tfstate" \
@@ -101,17 +101,17 @@ jobs:
         working-directory: ${{ steps.resolve.outputs.work_dir }}
         run: terraform fmt -recursive -check
 
-      - name: Terraform fmt check (gcs-buckets-bu module)
+      - name: Terraform fmt check (gcs-buckets module)
         shell: bash
-        working-directory: terraform/modules/gcs-buckets-bu
+        working-directory: terraform/modules/gcs-buckets
         run: terraform fmt -recursive -check
 
       - name: Setup TFLint
         uses: terraform-linters/setup-tflint@v4
 
-      - name: TFLint (gcs-buckets-bu module)
+      - name: TFLint (gcs-buckets module)
         shell: bash
-        working-directory: terraform/modules/gcs-buckets-bu
+        working-directory: terraform/modules/gcs-buckets
         run: |
           set -euo pipefail
           echo "### TFLint validation for GCS buckets module"
