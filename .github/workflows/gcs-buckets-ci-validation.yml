@@ -2,7 +2,7 @@ name: gcs-buckets-ci-validation
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-    branches: [ test, stage, main ]
+    branches: [ test, stage, main ] 
     paths: 
       - 'terraform/modules/gcs-buckets/**' 
       - 'terraform/gcs-buckets/env/**' 
